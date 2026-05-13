@@ -362,7 +362,9 @@ tabs = st.tabs([
     "👤 Incharge Analytics",
     "📅 Daily Trend",
     "📋 Summary Report",
-    "🗃️ Raw Data"
+    "🗃️ Raw Data",
+    "🏗️ Site Intelligence",
+    "📭 Missing Fault Data",
 ])
 
 # ══════════════════════════════════════════════════════════════════
@@ -558,6 +560,62 @@ with tabs[2]:
             "Unique_BTS":"Unique BTS","Total_Down_Hrs":"Total Down Hrs",
             "Avg_Down_Hrs":"Avg Down Hrs"
         }), use_container_width=True, hide_index=True)
+
+        # ── Fault Drill-Down ──────────────────────────────────────
+        st.markdown('<div class="section-header">🔍 Fault Drill-Down — BTS-Level Detail</div>', unsafe_allow_html=True)
+        all_faults = sorted(df["fault_type"].dropna().unique().tolist())
+        sel_fault  = st.selectbox("Select a fault type to drill into:", all_faults, key="fault_drill")
+        if sel_fault:
+            drill = df[df["fault_type"] == sel_fault].copy()
+            st.caption(f"**{len(drill)} events** across **{drill['bts_id'].nunique()} unique BTS** for fault: *{sel_fault}*")
+
+            # Repeat offenders
+            name_col_d = "bts_name" if "bts_name" in drill.columns else "bts_id"
+            repeat = drill.groupby([name_col_d, "bts_type", "vendor",
+                                    "sdca_name" if "sdca_name" in drill.columns else name_col_d]).agg(
+                Occurrences=("bts_id","count"),
+                Total_Down_Hrs=("down_hours","sum"),
+                Avg_Down_Hrs=("down_hours","mean"),
+                First_Seen=("bts_down_dt","min"),
+                Last_Seen=("bts_down_dt","max"),
+            ).reset_index().sort_values("Occurrences", ascending=False).round(2)
+
+            c1d, c2d = st.columns(2)
+            with c1d:
+                fig_d1 = px.bar(repeat.head(15), x=name_col_d, y="Occurrences",
+                                color="bts_type", text="Occurrences",
+                                title=f"Top 15 Repeat BTS — {sel_fault}",
+                                color_discrete_sequence=PALETTE)
+                fig_d1.update_xaxes(tickangle=40)
+                fig_d1.update_traces(textposition="outside")
+                dark_layout(fig_d1, height=380)
+                st.plotly_chart(fig_d1, use_container_width=True)
+            with c2d:
+                fig_d2 = px.bar(repeat.head(15), x=name_col_d, y="Total_Down_Hrs",
+                                color="Avg_Down_Hrs", text="Total_Down_Hrs",
+                                color_continuous_scale="Reds",
+                                title=f"Down Hours by BTS — {sel_fault}")
+                fig_d2.update_xaxes(tickangle=40)
+                fig_d2.update_traces(texttemplate="%{text:.1f}h", textposition="outside")
+                dark_layout(fig_d2, height=380)
+                st.plotly_chart(fig_d2, use_container_width=True)
+
+            st.dataframe(repeat, use_container_width=True, hide_index=True)
+
+        # ── Repeat Offender Summary (cross all faults) ────────────
+        st.markdown('<div class="section-header">🔁 Repeat Offenders — Same BTS, Same Fault</div>', unsafe_allow_html=True)
+        name_col_r = "bts_name" if "bts_name" in df.columns else "bts_id"
+        repeat_all = df[df["fault_type"].notna()].groupby(
+            [name_col_r, "fault_type", "bts_type"]).agg(
+            Occurrences=("bts_id","count"),
+            Total_Down_Hrs=("down_hours","sum"),
+        ).reset_index().sort_values("Occurrences", ascending=False)
+        repeat_all = repeat_all[repeat_all["Occurrences"] > 1].round(2).head(30)
+        if len(repeat_all):
+            st.caption(f"BTS–fault combinations that recurred **more than once** in the loaded period ({len(repeat_all)} pairs found)")
+            st.dataframe(repeat_all, use_container_width=True, hide_index=True)
+        else:
+            st.info("No repeat BTS–fault combinations found in this period.")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -974,3 +1032,312 @@ with tabs[7]:
 
     st.dataframe(disp, use_container_width=True, height=500)
     st.caption(f"Displaying {len(disp):,} rows")
+
+
+# ══════════════════════════════════════════════════════════════════
+# TAB 8: SITE INTELLIGENCE — Co-location / Single-Tech Analysis
+# ══════════════════════════════════════════════════════════════════
+with tabs[8]:
+    st.markdown('<div class="section-header">🏗️ Site Intelligence — Co-location & Selective Outage Analysis</div>', unsafe_allow_html=True)
+
+    has_site = "bts_site_id" in df.columns
+    has_type = "bts_type" in df.columns
+    has_date = "log_date" in df.columns
+
+    if not (has_site and has_type):
+        st.warning("Requires `bts_site_id` and `bts_type` columns in the alarm data.")
+    else:
+        # ── 1. Build site technology profile ──────────────────────
+        # All techs ever seen per site (across full loaded dataset, not filtered)
+        site_all_techs = df_all.groupby("bts_site_id")["bts_type"].apply(
+            lambda x: set(x.str.upper().dropna())
+        ).reset_index()
+        site_all_techs.columns = ["bts_site_id", "all_techs"]
+        site_all_techs["tech_count"] = site_all_techs["all_techs"].apply(len)
+        site_all_techs["tech_label"] = site_all_techs["all_techs"].apply(
+            lambda s: "+".join(sorted(s))
+        )
+
+        multi_tech_site_ids = site_all_techs[site_all_techs["tech_count"] > 1]["bts_site_id"]
+
+        # ── 2. Per-event: how many techs were affected at the same
+        #       site on the same calendar day? ─────────────────────
+        if has_date:
+            daily_site_techs = (
+                df.groupby(["log_date", "bts_site_id"])["bts_type"]
+                .nunique()
+                .reset_index()
+                .rename(columns={"bts_type": "techs_down_today"})
+            )
+            df_si = df.merge(daily_site_techs, on=["log_date", "bts_site_id"], how="left")
+        else:
+            df_si = df.copy()
+            df_si["techs_down_today"] = 1
+
+        df_si = df_si.merge(
+            site_all_techs[["bts_site_id", "tech_count", "tech_label"]],
+            on="bts_site_id", how="left"
+        )
+        df_si["tech_count"]  = df_si["tech_count"].fillna(1).astype(int)
+        df_si["techs_down_today"] = df_si["techs_down_today"].fillna(1).astype(int)
+
+        def classify_outage(row):
+            total = row["tech_count"]
+            down  = row["techs_down_today"]
+            if total == 1:
+                return "Single-Tech Site"
+            elif down == 1:
+                return "🟡 Selective (1 tech only)"
+            elif down >= total:
+                return "🔴 Site-Wide (all techs)"
+            else:
+                return "🟠 Partial (some techs)"
+
+        df_si["outage_class"] = df_si.apply(classify_outage, axis=1)
+
+        # ── 3. KPI cards ──────────────────────────────────────────
+        n_multi_sites  = len(multi_tech_site_ids)
+        n_selective    = (df_si["outage_class"] == "🟡 Selective (1 tech only)").sum()
+        n_sitewide     = (df_si["outage_class"] == "🔴 Site-Wide (all techs)").sum()
+        n_partial      = (df_si["outage_class"] == "🟠 Partial (some techs)").sum()
+
+        k1, k2, k3, k4 = st.columns(4)
+        kpi(k1, f"{n_multi_sites}",  "Multi-Tech Sites",        "Sites with 2+ technologies")
+        kpi(k2, f"{n_selective}",    "Selective Outages",       "1 tech down, others OK")
+        kpi(k3, f"{n_partial}",      "Partial Site Outages",    "Some techs affected")
+        kpi(k4, f"{n_sitewide}",     "Full Site Outages",       "All techs went down")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── 4. Outage classification breakdown ────────────────────
+        st.markdown('<div class="section-header">Outage Classification Breakdown</div>', unsafe_allow_html=True)
+        oc_cnt = df_si["outage_class"].value_counts().reset_index()
+        oc_cnt.columns = ["Outage Class", "Events"]
+        oc_hours = df_si.groupby("outage_class")["down_hours"].sum().reset_index()
+        oc_hours.columns = ["Outage Class", "Total_Down_Hrs"]
+        oc_merged = oc_cnt.merge(oc_hours, on="Outage Class")
+
+        c1s, c2s = st.columns(2)
+        with c1s:
+            fig_oc1 = px.pie(oc_merged, values="Events", names="Outage Class",
+                             hole=0.4, title="Event Share by Outage Class",
+                             color_discrete_sequence=["#f59e0b","#ef4444","#f97316","#60a5fa"])
+            fig_oc1.update_traces(textinfo="percent+label")
+            dark_layout(fig_oc1, height=340)
+            st.plotly_chart(fig_oc1, use_container_width=True)
+        with c2s:
+            fig_oc2 = px.bar(oc_merged, x="Outage Class", y="Total_Down_Hrs",
+                             color="Outage Class", text="Total_Down_Hrs",
+                             title="Total Down Hours by Outage Class",
+                             color_discrete_sequence=["#f59e0b","#ef4444","#f97316","#60a5fa"])
+            fig_oc2.update_traces(texttemplate="%{text:.0f}h", textposition="outside")
+            dark_layout(fig_oc2, height=340)
+            st.plotly_chart(fig_oc2, use_container_width=True)
+
+        # ── 5. Selective outage deep-dive ─────────────────────────
+        st.markdown('<div class="section-header">🟡 Selective Outage Deep-Dive (1 Tech Down at Multi-Tech Sites)</div>', unsafe_allow_html=True)
+        sel_df = df_si[df_si["outage_class"] == "🟡 Selective (1 tech only)"].copy()
+        if len(sel_df) == 0:
+            st.info("No selective outages found in this period.")
+        else:
+            st.caption(
+                f"These **{len(sel_df)} events** occurred at sites with multiple technologies, "
+                f"but only ONE technology was affected — pointing to **tech-specific hardware, "
+                f"software, or configuration issues** rather than power/transmission."
+            )
+
+            c3s, c4s = st.columns(2)
+            with c3s:
+                sel_by_type = sel_df.groupby("bts_type").agg(
+                    Events=("bts_id","count"),
+                    Total_Down_Hrs=("down_hours","sum"),
+                    Unique_Sites=("bts_site_id","nunique"),
+                ).reset_index().round(2)
+                fig_sel1 = px.bar(sel_by_type, x="bts_type", y="Events",
+                                  color="bts_type", text="Events",
+                                  title="Selective Outages by Technology",
+                                  color_discrete_sequence=PALETTE)
+                fig_sel1.update_traces(textposition="outside")
+                dark_layout(fig_sel1, height=340)
+                st.plotly_chart(fig_sel1, use_container_width=True)
+            with c4s:
+                if "fault_type" in sel_df.columns:
+                    sel_fault = sel_df["fault_type"].value_counts().head(10).reset_index()
+                    sel_fault.columns = ["fault_type","count"]
+                    fig_sel2 = px.bar(sel_fault, x="count", y="fault_type",
+                                      orientation="h", color="count",
+                                      color_continuous_scale="Oranges",
+                                      title="Top Fault Types in Selective Outages")
+                    fig_sel2.update_layout(yaxis=dict(autorange="reversed"))
+                    dark_layout(fig_sel2, height=340)
+                    st.plotly_chart(fig_sel2, use_container_width=True)
+
+            # Selective outage BTS list
+            name_col_s = "bts_name" if "bts_name" in sel_df.columns else "bts_id"
+            show_cols = [c for c in [name_col_s, "bts_site_id", "bts_type", "tech_label",
+                                     "sdca_name", "fault_type", "down_hours",
+                                     "bts_down_dt", "incharge"] if c in sel_df.columns]
+            st.dataframe(sel_df[show_cols].sort_values("down_hours", ascending=False),
+                         use_container_width=True, hide_index=True, height=350)
+
+        # ── 6. Site-wide outage deep-dive ─────────────────────────
+        st.markdown('<div class="section-header">🔴 Site-Wide Outage Deep-Dive (All Techs Affected)</div>', unsafe_allow_html=True)
+        sw_df = df_si[df_si["outage_class"] == "🔴 Site-Wide (all techs)"].copy()
+        if len(sw_df) == 0:
+            st.info("No site-wide outages found in this period.")
+        else:
+            st.caption(
+                f"**{len(sw_df)} events** where all technologies at a site went down together — "
+                f"typically caused by **power failure, OFC/E1 transmission cut, or civil/site access issues**."
+            )
+            name_col_sw = "bts_name" if "bts_name" in sw_df.columns else "bts_id"
+            sw_site = sw_df.groupby(["bts_site_id", "tech_label",
+                                     "sdca_name" if "sdca_name" in sw_df.columns else "bts_site_id"]).agg(
+                Events=("bts_id","count"),
+                Total_Down_Hrs=("down_hours","sum"),
+                Dominant_Fault=("fault_type", lambda x: x.mode()[0] if x.notna().any() else "N/A"),
+                Incharge=("incharge", lambda x: x.mode()[0] if x.notna().any() else "N/A"),
+            ).reset_index().round(2).sort_values("Total_Down_Hrs", ascending=False)
+            st.dataframe(sw_site, use_container_width=True, hide_index=True, height=350)
+
+        # ── 7. Technology profile of sites ───────────────────────
+        st.markdown('<div class="section-header">Site Technology Profile</div>', unsafe_allow_html=True)
+        tech_profile = site_all_techs[site_all_techs["bts_site_id"].isin(df["bts_site_id"])].copy()
+        profile_cnt = tech_profile["tech_label"].value_counts().reset_index()
+        profile_cnt.columns = ["Tech Combination", "Sites"]
+        c5s, c6s = st.columns(2)
+        with c5s:
+            fig_tp = px.pie(profile_cnt, values="Sites", names="Tech Combination",
+                            hole=0.4, title="Sites by Technology Combination",
+                            color_discrete_sequence=PALETTE)
+            fig_tp.update_traces(textinfo="percent+label")
+            dark_layout(fig_tp, height=320)
+            st.plotly_chart(fig_tp, use_container_width=True)
+        with c6s:
+            st.markdown("##### Technology Combination — Site Count")
+            st.dataframe(profile_cnt, use_container_width=True, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════════
+# TAB 9: MISSING FAULT DATA
+# ══════════════════════════════════════════════════════════════════
+with tabs[9]:
+    st.markdown('<div class="section-header">📭 Missing Fault Data — Unresolved Alarm Records</div>', unsafe_allow_html=True)
+
+    missing_df = df[df["fault_type"].isna()].copy() if "fault_type" in df.columns else df.copy()
+
+    if len(missing_df) == 0:
+        st.success("✅ All alarm records have a fault_type filled in!")
+    else:
+        pct_missing = len(missing_df) / max(len(df), 1) * 100
+        st.warning(
+            f"**{len(missing_df):,} records ({pct_missing:.1f}% of total)** have no fault_type entered. "
+            f"These need to be updated by the respective incharge/JTO in the source system."
+        )
+
+        # ── KPIs ──────────────────────────────────────────────────
+        m1, m2, m3, m4 = st.columns(4)
+        kpi(m1, f"{len(missing_df):,}",                      "Missing Records",      "fault_type = blank")
+        kpi(m2, f"{missing_df['bts_id'].nunique():,}",        "Unique BTS",           "with blank fault")
+        kpi(m3, f"{missing_df['down_hours'].sum():.0f} h",    "Down Hours (blank)",   "unattributed outage time")
+        kpi(m4, f"{missing_df['incharge'].nunique() if 'incharge' in missing_df.columns else 0}",
+            "Incharges Affected", "with unfilled records")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Incharge responsibility breakdown ─────────────────────
+        if "incharge" in missing_df.columns and missing_df["incharge"].notna().any():
+            st.markdown('<div class="section-header">Incharge-wise Missing Fault Data</div>', unsafe_allow_html=True)
+            ic_miss = missing_df[missing_df["incharge"].notna()].groupby("incharge").agg(
+                Missing_Records=("bts_id","count"),
+                Unique_BTS=("bts_id","nunique"),
+                Total_Down_Hrs=("down_hours","sum"),
+            ).reset_index().sort_values("Missing_Records", ascending=False).round(2)
+
+            c1m, c2m = st.columns(2)
+            with c1m:
+                fig_m1 = px.bar(ic_miss, x="incharge", y="Missing_Records",
+                                color="Missing_Records", text="Missing_Records",
+                                color_continuous_scale="Reds",
+                                title="Unfilled Fault Records per Incharge")
+                fig_m1.update_traces(textposition="outside")
+                dark_layout(fig_m1, height=360)
+                st.plotly_chart(fig_m1, use_container_width=True)
+            with c2m:
+                fig_m2 = px.bar(ic_miss, x="incharge", y="Total_Down_Hrs",
+                                color="Total_Down_Hrs", text="Total_Down_Hrs",
+                                color_continuous_scale="Oranges",
+                                title="Unattributed Down Hours per Incharge")
+                fig_m2.update_traces(texttemplate="%{text:.0f}h", textposition="outside")
+                dark_layout(fig_m2, height=360)
+                st.plotly_chart(fig_m2, use_container_width=True)
+
+        # ── BTS Type breakdown ────────────────────────────────────
+        if "bts_type" in missing_df.columns:
+            st.markdown('<div class="section-header">Missing Fault Data by BTS Type & Duration Band</div>', unsafe_allow_html=True)
+            c3m, c4m = st.columns(2)
+            with c3m:
+                bt_miss = missing_df.groupby("bts_type").agg(
+                    Records=("bts_id","count"),
+                    Down_Hrs=("down_hours","sum"),
+                ).reset_index().round(2)
+                fig_m3 = px.bar(bt_miss, x="bts_type", y="Records", color="bts_type",
+                                text="Records", title="Missing Records by BTS Type",
+                                color_discrete_sequence=PALETTE)
+                fig_m3.update_traces(textposition="outside")
+                dark_layout(fig_m3, height=320)
+                st.plotly_chart(fig_m3, use_container_width=True)
+            with c4m:
+                if "duration_band" in missing_df.columns:
+                    db_miss = missing_df["duration_band"].value_counts().reindex(
+                        ["< 1 hr","1–4 hrs","4–8 hrs","8–24 hrs","> 24 hrs"]
+                    ).fillna(0).reset_index()
+                    db_miss.columns = ["band","count"]
+                    fig_m4 = px.pie(db_miss, values="count", names="band", hole=0.4,
+                                    title="Missing Records by Duration Band",
+                                    color_discrete_sequence=["#22c55e","#84cc16","#f59e0b","#ef4444","#7c3aed"])
+                    fig_m4.update_traces(textinfo="percent+label")
+                    dark_layout(fig_m4, height=320)
+                    st.plotly_chart(fig_m4, use_container_width=True)
+
+        # ── Day-wise trend of missing data ────────────────────────
+        if "log_date" in missing_df.columns:
+            st.markdown('<div class="section-header">Daily Trend of Unfilled Records</div>', unsafe_allow_html=True)
+            daily_miss = missing_df.groupby("log_date").agg(
+                Missing=("bts_id","count"),
+            ).reset_index().sort_values("log_date")
+            daily_miss["log_date"] = pd.to_datetime(daily_miss["log_date"])
+            fig_m5 = px.bar(daily_miss, x="log_date", y="Missing",
+                            text="Missing", title="Daily Count of Records with No Fault Type",
+                            color_discrete_sequence=["#f97316"])
+            fig_m5.update_traces(textposition="outside")
+            dark_layout(fig_m5, height=320)
+            st.plotly_chart(fig_m5, use_container_width=True)
+
+        # ── Full exportable table ─────────────────────────────────
+        st.markdown('<div class="section-header">📋 Full List — Records Needing Fault Type Update</div>', unsafe_allow_html=True)
+        show_miss_cols = [c for c in [
+            "bts_name","bts_site_id","bts_type","vendor",
+            "sdca_name","bts_down_dt","bts_up_dt","down_hours",
+            "duration_band","incharge","JTO INCHARGE","SITENAME","_source_file"
+        ] if c in missing_df.columns]
+        st.dataframe(
+            missing_df[show_miss_cols].sort_values("down_hours", ascending=False),
+            use_container_width=True, height=450, hide_index=True
+        )
+
+        # Export
+        @st.cache_data
+        def export_missing(df_miss):
+            buf = BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df_miss.to_excel(writer, sheet_name="Missing_Fault_Data", index=False)
+            return buf.getvalue()
+
+        miss_bytes = export_missing(missing_df)
+        st.download_button(
+            label="📥 Download Missing Records (Excel) — for Field Team Follow-up",
+            data=miss_bytes,
+            file_name=f"BTS_Missing_FaultType_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
