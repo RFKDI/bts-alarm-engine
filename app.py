@@ -850,13 +850,47 @@ with tabs[6]:
 
     # Troubleshooting category analysis
     st.markdown("#### 🔧 Troubleshooting Category Analysis")
+    # ── Keyword order matters: first match wins, so put longer/specific phrases
+    #    before short ones to avoid partial false-matches.
+    #    Categories are evaluated top-to-bottom; Power/Battery before Hardware
+    #    so "Pp Control Panel Fault" (pp control) hits Power/Battery, not Hardware.
     cat_map = {
-        "Hardware": ["hardware", "bts", "board", "card", "equipment"],
-        "Power/Battery": ["battery", "mains", "power", "dg", "generator", "eb"],
-        "Environment": ["temperature", "ac", "cooling", "fire", "flood"],
-        "Transmission": ["transmission", "link", "fiber", "microwave", "ip"],
-        "Software/Config": ["software", "config", "reset", "upgrade", "parameter"],
-        "Unknown/Other": []
+        "Power/Battery":   [
+            "battery", "mains", "power plant", "pp control",
+            "dg", "generator", "eb pole", "eb supply", "eb ",
+        ],
+        "Transmission":    [
+            "ofc",          # optical fibre cable breaks (SSA OFC, CNTX-Zone OFC)
+            "e1",           # E1 link failures
+            "aggregation",  # aggregation site issues
+            "hub site",     # due-to-hub-site outages
+            "hub",
+            "ssa media",    # SSA media issues
+            "media issue",  # generic media issues
+            "cntx",         # concentration-zone breaks
+            "rrh link",     # RRH link-down
+            "link down",
+            "transmission",
+            "fiber", "fibre",
+            "microwave",
+        ],
+        "Hardware":        [
+            "cpan",         # control panel faults
+            "tcs",          # TCS/Tejas vendor visits → hardware rectification
+            "tejas",
+            "hardware",
+            "board", "card", "equipment",
+        ],
+        "Environment":     [
+            "tempature",    # common field typo for "temperature"
+            "temperature",
+            "ac ", "cooling", "fire", "flood",
+        ],
+        "Software/Config": [
+            "resetting",    # site resetting issue
+            "software", "config", "reset", "upgrade", "parameter",
+        ],
+        "Unknown/Other":   []
     }
     if "fault_type" in df.columns:
         def categorize(ft):
